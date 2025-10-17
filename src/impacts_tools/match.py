@@ -34,7 +34,7 @@ class Match(ABC):
         self.name = None
         self.data = None
         
-    def qc_radar(self, radar_dataset, alt_bounds_p3, qc=False):
+    def qc_radar(self, radar_dataset, alt_bounds_p3, include_ldr=False, qc=False):
         """
         xarray.Dataset (1-D) of QC'd radar data, with bad values removed
         
@@ -43,6 +43,8 @@ class Match(ABC):
         radar_dataset: impacts_tools.er2.XXX(Radar).Dataset object
         alt_bounds_p3: tuple
             Minimum and maximum P-3 altitude (m) for flight segment.
+        include_ldr: bool
+            Optionally include LDR pixels in masking criteria
         qc: bool
             Additionally applies a filter on suspected P-3 skinpaints
         """
@@ -50,20 +52,37 @@ class Match(ABC):
             # mask based on alt relative to P-3 (+/- 250 m) and ground
             ds_qc = radar_dataset.copy()
             mask = np.ones(ds_qc.height.shape, dtype=bool)
-            mask[
-                (ds_qc['height'].values >= alt_bounds_p3[0] - 250.) &
-                (ds_qc['height'].values <= alt_bounds_p3[1] + 250.) &
-                (~np.isnan(ds_qc['dbz'].values)) &
-                (~np.isnan(ds_qc['vel'].values)) &
-                (ds_qc['height'].values >= 500.)] = False
-            mask = xr.DataArray(
-                data = mask,
-                dims = ['range', 'time'],
-                coords = dict(
-                    range = ds_qc.range,
-                    time = ds_qc.time
+            if (self.name == 'Matched CRS') and include_ldr:
+                mask[
+                    (ds_qc['height'].values >= alt_bounds_p3[0] - 250.) &
+                    (ds_qc['height'].values <= alt_bounds_p3[1] + 250.) &
+                    (~np.isnan(ds_qc['dbz'].values)) &
+                    (~np.isnan(ds_qc['vel'].values)) &
+                    (~np.isnan(ds_qc['ldr'].values)) &
+                    (ds_qc['height'].values >= 500.)] = False
+                mask = xr.DataArray(
+                    data = mask,
+                    dims = ['range', 'time'],
+                    coords = dict(
+                        range = ds_qc.range,
+                        time = ds_qc.time
+                    )
                 )
-            )
+            else:
+                mask[
+                    (ds_qc['height'].values >= alt_bounds_p3[0] - 250.) &
+                    (ds_qc['height'].values <= alt_bounds_p3[1] + 250.) &
+                    (~np.isnan(ds_qc['dbz'].values)) &
+                    (~np.isnan(ds_qc['vel'].values)) &
+                    (ds_qc['height'].values >= 500.)] = False
+                mask = xr.DataArray(
+                    data = mask,
+                    dims = ['range', 'time'],
+                    coords = dict(
+                        range = ds_qc.range,
+                        time = ds_qc.time
+                    )
+                )
             ds_qc = ds_qc.where(~mask) # set nan outside of these alts
             
             if qc: # additional qc based on dbz variability and spectrum width
@@ -206,7 +225,20 @@ class Match(ABC):
                     lat = lat, lon = lon),
                 attrs = radar_dataset['vel'].attrs
             )
-            data_vars = {'dbz': dbz, 'vel': vel}
+            if (self.name == 'Matched CRS') and include_ldr:
+                ldr = xr.DataArray(
+                    data =  (
+                        xr.DataArray(np.ones(radar_dataset.dims['range']), dims=('range')) *
+                        radar_dataset['ldr']).values.flatten(),
+                    dims = 'gate_idx',
+                    coords = dict(
+                        time = time_flat, height = hght, distance = dist,
+                        lat = lat, lon = lon),
+                    attrs = radar_dataset['ldr'].attrs
+                )
+                data_vars = {'dbz': dbz, 'vel': vel, 'ldr': ldr}
+            else:
+                data_vars = {'dbz': dbz, 'vel': vel}
         elif self.name == 'Matched HIWRAP':
             dbz_ka = xr.DataArray(
                 data =  radar_dataset['dbz_ka'].values.flatten(),
@@ -843,6 +875,10 @@ class Match(ABC):
     def match_radar(
             self, radar_qc, p3_object, query_k, dist_thresh, time_thresh,
             ref_coords, n_workers):
+        # first check if QC'd data has LDR variable (CRS; include_ldr=True)
+        contains_ldr = False
+        if 'ldr' in list(radar_qc.data_vars):
+            contains_ldr = True
         # define map proj to calculate cartesian distances
         if ref_coords is None:
             ref_coords = (p3_object['lat'].values[0], p3_object['lon'].values[0])
@@ -885,6 +921,10 @@ class Match(ABC):
             vel_matched = np.ma.masked_where(
                 prind1d == 0, radar_qc['vel'].values[prind1d]
             )
+            if contains_ldr:
+                ldr_matched = np.ma.masked_where(
+                    prind1d == 0, radar_qc['ldr'].values[prind1d]
+                )
             key_dbz, key_vel = ('dbz', 'vel')
         elif self.name == 'Matched HIWRAP':
             dbz_matched = np.ma.masked_where(
@@ -941,6 +981,17 @@ class Match(ABC):
             w1 = np.ma.sum(W_d_k2 * vel_matched, axis=1) # weighted sum of vel per N-s period
             w2 = np.ma.sum(W_d_k2, axis=1) # sum of weights per N-s period
             vel_matched = w1 / w2 # flatten matched vel
+
+            # ldr, if applicable
+            if contains_ldr:
+                W_d_k2 = np.ma.masked_where(
+                    np.ma.getmask(ldr_matched), W_d_k.copy()
+                ) # mask weights where ldr is masked
+                w1 = np.ma.sum(
+                    W_d_k2 * 10.**(ldr_matched / 10.), axis=1
+                ) # weighted sum of ldr (linear units) per N-s period
+                w2 = np.ma.sum(W_d_k2, axis=1) # sum of weights per N-s period
+                ldr_matched = 10. * np.ma.log10(w1 / w2) # flatten matched, weighted ldr [dB]
             
             # dbz2 and vel2 (HIWRAP Ku)
             if self.name == 'Matched HIWRAP':
@@ -1124,12 +1175,30 @@ class Match(ABC):
                 freq = 'w'
             elif self.name == 'Matched EXRAD':
                 freq = 'x'
-            data_vars = {
-                'dist_diff': ddiff,
-                'time_diff': tdiff,
-                f'dbz_{freq}': dbz,
-                f'vel_{freq}': vel
-            }
+            if contains_ldr:
+                ldr = xr.DataArray(
+                    data = np.ma.masked_where(mask_final, ldr_matched),
+                    dims = 'time',
+                    coords = dict(time = time, time_radar = time_radar),
+                    attrs = dict(
+                        description = 'Mean linear depolarization ratio among matched radar gates',
+                        units = 'dB'
+                    )
+                )
+                data_vars = {
+                    'dist_diff': ddiff,
+                    'time_diff': tdiff,
+                    f'dbz_{freq}': dbz,
+                    f'vel_{freq}': vel,
+                    f'ldr_{freq}': ldr
+                }
+            else:
+                data_vars = {
+                    'dist_diff': ddiff,
+                    'time_diff': tdiff,
+                    f'dbz_{freq}': dbz,
+                    f'vel_{freq}': vel
+                }
             
         # create dataset
         ds = xr.Dataset(
@@ -1389,6 +1458,9 @@ class Crs(Match):
         Maximum distance (m) allowed in the kdTree search
     time_thresh: None or float
         Maximum time offset (s) between ER-2 and P-3 allowed for matched instance
+    include_ldr: bool
+        True - include LDR pixels when finding good pixels, and match to P-3
+        False - exclude LDR pixels; only match Ze and Velocity
     qc: bool
         True - remove gates with high dbz gradient, no dbz, low spw
         False - only remove gates with no dbz
@@ -1399,7 +1471,7 @@ class Crs(Match):
     
     def __init__(
             self, radar_object, p3_object, query_k=30, dist_thresh=4000.,
-            time_thresh=None, qc=False, ref_coords=None, n_workers=1):
+            time_thresh=None, include_ldr=False, qc=False, ref_coords=None, n_workers=1):
         self.name = 'Matched CRS'
         
         # get P-3 alt bounds
@@ -1408,7 +1480,7 @@ class Crs(Match):
         alt_boundsP3 = (alt_minP3, alt_maxP3)
         
         # qc radar data (threshold by Z gradient and SW if specified)
-        radar_qc = self.qc_radar(radar_object, alt_boundsP3, qc)
+        radar_qc = self.qc_radar(radar_object, alt_boundsP3, include_ldr, qc)
         
         # read the raw data
         self.data = self.match_radar(
