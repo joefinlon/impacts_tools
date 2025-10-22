@@ -727,6 +727,6 @@ locals().update(cmap_d)
 for name, cmap in cmap_d.items():
     full_name = 'radar_' + name
     try: # support newer versions of matplotlib; JF 10/21/2025
-    	mpl.colormaps.register(cmap=cmap, name='your_cmap_name')
+    	mpl.colormaps.register(cmap=cmap, name=full_name)
     except AttributeError: # matplotlib < 3.7
     	mpl.cm.register_cmap(name=full_name, cmap=cmap)
